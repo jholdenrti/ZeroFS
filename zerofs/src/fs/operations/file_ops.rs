@@ -391,7 +391,7 @@ impl ZeroFS {
                 // This is critical when await_durable=false, as the inode may not be
                 // visible in SlateDB yet. Without caching, load_inode() calls will fail
                 // with "inode key not found", especially with 9P cache=none.
-                use crate::fs::cache::{CacheKey, CacheValue};
+                use crate::fs::cache::CacheValue;
                 self.cache
                     .insert(CacheKey::Metadata(file_id), CacheValue::Metadata(Arc::new(inode.clone())))
                     .await;
