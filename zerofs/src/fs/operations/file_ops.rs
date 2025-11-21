@@ -13,6 +13,7 @@ use futures::stream::{self, StreamExt};
 use slatedb::config::WriteOptions;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tracing::{debug, error};
 
 const READ_CHUNK_BUFFER_SIZE: usize = 1024;
@@ -181,8 +182,6 @@ impl ZeroFS {
                     self.global_stats.commit_update(&update);
                 }
 
-                self.cache.remove(CacheKey::Metadata(id)).await;
-
                 let elapsed = start_time.elapsed();
                 debug!(
                     "Write processed successfully for inode {}, new size: {}, took: {:?}",
@@ -195,7 +194,19 @@ impl ZeroFS {
                 self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
-                Ok(InodeWithId { inode: &inode, id }.into())
+                let attrs = InodeWithId { inode: &inode, id }.into();
+
+                // Release write lock before caching
+                drop(_guard);
+
+                // Cache the updated inode to ensure size changes are immediately visible
+                // Critical for SQLite WAL mode with cache=none
+                use crate::fs::cache::CacheValue;
+                self.cache
+                    .insert(CacheKey::Metadata(id), CacheValue::Metadata(Arc::new(inode.clone())))
+                    .await;
+
+                Ok(attrs)
             }
             _ => Err(FsError::IsDirectory),
         }
@@ -341,6 +352,19 @@ impl ZeroFS {
                     id: file_id,
                 }
                 .into();
+
+                // Release the write lock before caching to avoid deadlocks
+                drop(_guard);
+
+                // Cache the newly created inode to ensure it's available for immediate reads
+                // This is critical when await_durable=false, as the inode may not be
+                // visible in SlateDB yet. Without caching, load_inode() calls will fail
+                // with "inode key not found", especially with 9P cache=none.
+                use crate::fs::cache::CacheValue;
+                self.cache
+                    .insert(CacheKey::Metadata(file_id), CacheValue::Metadata(Arc::new(inode.clone())))
+                    .await;
+
                 Ok((file_id, file_attrs))
             }
             _ => Err(FsError::NotDirectory),

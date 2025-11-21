@@ -277,7 +277,12 @@ impl ZeroFS {
             .await
             .map_err(|_| FsError::IoError)?;
 
-        self.cache.remove(CacheKey::Metadata(inode_id)).await;
+        // Cache the updated inode to ensure changes are immediately visible
+        // Critical for SQLite WAL mode with cache=none and await_durable=false
+        use crate::fs::cache::CacheValue;
+        self.cache
+            .insert(CacheKey::Metadata(inode_id), CacheValue::Metadata(Arc::new(inode.clone())))
+            .await;
 
         Ok(())
     }

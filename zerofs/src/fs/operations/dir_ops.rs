@@ -14,6 +14,7 @@ use futures::pin_mut;
 use futures::stream::{self, StreamExt};
 use slatedb::config::WriteOptions;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tracing::debug;
 
 impl ZeroFS {
@@ -249,6 +250,19 @@ impl ZeroFS {
                     id: new_dir_id,
                 }
                 .into();
+
+                // Release the write lock before caching to avoid deadlocks
+                drop(_guard);
+
+                // Cache the newly created inode to ensure it's available for immediate reads
+                // This is critical when await_durable=false, as the inode may not be
+                // visible in SlateDB yet. Without caching, load_inode() calls will fail
+                // with "inode key not found", especially with 9P cache=none.
+                use crate::fs::cache::CacheValue;
+                self.cache
+                    .insert(CacheKey::Metadata(new_dir_id), CacheValue::Metadata(Arc::new(new_inode.clone())))
+                    .await;
+
                 Ok((new_dir_id, attrs))
             }
             _ => Err(FsError::NotDirectory),
