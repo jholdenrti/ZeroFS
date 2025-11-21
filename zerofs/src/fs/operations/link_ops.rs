@@ -156,9 +156,20 @@ impl ZeroFS {
         // This is critical when await_durable=false, as the inode may not be
         // visible in SlateDB yet. Without caching, load_inode() calls will fail
         // with "inode key not found", especially with 9P cache=none.
-        use crate::fs::cache::CacheValue;
+        use crate::fs::cache::{CacheKey, CacheValue};
         self.cache
             .insert(CacheKey::Metadata(new_id), CacheValue::Metadata(Arc::new(symlink_inode.clone())))
+            .await;
+
+        // Cache the directory entry so the symlink is immediately visible in lookups
+        self.cache
+            .insert(
+                CacheKey::DirEntry {
+                    dir_id: dirid,
+                    name: linkname.to_vec(),
+                },
+                CacheValue::DirEntry(new_id),
+            )
             .await;
 
         Ok(result)
@@ -290,6 +301,18 @@ impl ZeroFS {
                 CacheKey::Metadata(fileid),
                 CacheKey::Metadata(linkdirid),
             ])
+            .await;
+
+        // Cache the directory entry so the hardlink is immediately visible in lookups
+        use crate::fs::cache::{CacheKey, CacheValue};
+        self.cache
+            .insert(
+                CacheKey::DirEntry {
+                    dir_id: linkdirid,
+                    name: linkname.to_vec(),
+                },
+                CacheValue::DirEntry(fileid),
+            )
             .await;
 
         self.stats.links_created.fetch_add(1, Ordering::Relaxed);
