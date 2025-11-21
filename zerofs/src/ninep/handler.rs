@@ -354,6 +354,19 @@ impl NinePHandler {
     }
 
     async fn handle_clunk(&self, tag: u16, tc: Tclunk) -> P9Message {
+        // Get the fid before removing it so we can access its inode_id
+        if let Some(fid) = self.session.fids.get(&tc.fid) {
+            let inode_id = fid.inode_id;
+            // Release the fid reference before calling lock manager
+            drop(fid);
+
+            // Release all locks held by this session on this inode
+            // This implements POSIX semantics: closing any fd releases all locks on that file
+            self.lock_manager
+                .release_inode_locks(inode_id, self.handler_id)
+                .await;
+        }
+
         self.session.fids.remove(&tc.fid);
         P9Message::new(tag, Message::Rclunk(Rclunk))
     }
@@ -2015,5 +2028,368 @@ mod tests {
             }
             _ => panic!("Expected Rreaddir"),
         };
+    }
+
+    /// Test to reproduce SQLite locking hang issue
+    ///
+    /// This test simulates SQLite's lock upgrade pattern:
+    /// 1. Open file, acquire SHARED lock
+    /// 2. Close and reopen file (new fid)
+    /// 3. Acquire EXCLUSIVE lock
+    ///
+    /// Expected: Should succeed (POSIX semantics)
+    /// Actual (before fix): Hangs or fails due to ghost locks
+    #[tokio::test]
+    async fn test_sqlite_lock_pattern_with_fid_change() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let lock_manager = Arc::new(FileLockManager::new());
+        let handler = NinePHandler::new(fs.clone(), lock_manager.clone());
+
+        // Setup session
+        let version_msg = Message::Tversion(Tversion {
+            msize: 8192,
+            version: P9String::new(b"9P2000.L".to_vec()),
+        });
+        handler.handle_message(0, version_msg).await;
+
+        // Attach
+        let attach_msg = Message::Tattach(Tattach {
+            fid: 1,
+            afid: u32::MAX,
+            uname: P9String::new(b"test".to_vec()),
+            aname: P9String::new(Vec::new()),
+            n_uname: 1000,
+        });
+        handler.handle_message(1, attach_msg).await;
+
+        // Create a test database file
+        let walk_msg = Message::Twalk(Twalk {
+            fid: 1,
+            newfid: 2,
+            nwname: 0,
+            wnames: vec![],
+        });
+        handler.handle_message(2, walk_msg).await;
+
+        let create_msg = Message::Tlcreate(Tlcreate {
+            fid: 2,
+            name: P9String::new(b"test.db".to_vec()),
+            flags: 0x8002, // O_RDWR | O_CREAT
+            mode: 0o644,
+            gid: 1000,
+        });
+        let create_resp = handler.handle_message(3, create_msg).await;
+        assert!(matches!(create_resp.body, Message::Rlcreate(_)));
+
+        // Step 1: Acquire SHARED lock (SQLite's first step)
+        let lock_msg = Message::Tlock(Tlock {
+            fid: 2,
+            lock_type: LockType::ReadLock,
+            flags: 0, // Non-blocking
+            start: 0,
+            length: 100,
+            proc_id: 12345,
+            client_id: P9String::new(b"test-client".to_vec()),
+        });
+        let lock_resp = handler.handle_message(4, lock_msg).await;
+
+        match &lock_resp.body {
+            Message::Rlock(rlock) => {
+                assert_eq!(rlock.status, LockStatus::Success, "Failed to acquire SHARED lock");
+            }
+            Message::Rlerror(err) => {
+                panic!("Failed to acquire SHARED lock: error code {}", err.ecode);
+            }
+            _ => panic!("Unexpected response to Tlock: {:?}", lock_resp.body),
+        }
+
+        // Step 2: Close the fid (simulating SQLite closing the fd)
+        let clunk_msg = Message::Tclunk(Tclunk { fid: 2 });
+        handler.handle_message(5, clunk_msg).await;
+
+        // Step 3: Reopen the file with a new fid
+        let walk_msg = Message::Twalk(Twalk {
+            fid: 1,
+            newfid: 3,
+            nwname: 1,
+            wnames: vec![P9String::new(b"test.db".to_vec())],
+        });
+        handler.handle_message(6, walk_msg).await;
+
+        let open_msg = Message::Tlopen(Tlopen {
+            fid: 3,
+            flags: 0x8002, // O_RDWR
+        });
+        handler.handle_message(7, open_msg).await;
+
+        // Step 4: Try to acquire EXCLUSIVE lock (SQLite's lock upgrade)
+        let exclusive_lock_msg = Message::Tlock(Tlock {
+            fid: 3,
+            lock_type: LockType::WriteLock,
+            flags: 0, // Non-blocking
+            start: 0,
+            length: 100,
+            proc_id: 12345,
+            client_id: P9String::new(b"test-client".to_vec()),
+        });
+        let exclusive_resp = handler.handle_message(8, exclusive_lock_msg).await;
+
+        match &exclusive_resp.body {
+            Message::Rlock(rlock) => {
+                assert_eq!(
+                    rlock.status,
+                    LockStatus::Success,
+                    "Failed to acquire EXCLUSIVE lock after fid change - old locks not released!"
+                );
+            }
+            Message::Rlerror(err) => {
+                panic!("Failed to acquire EXCLUSIVE lock: error code {} (EAGAIN={}). This means old locks weren't properly released on clunk!",
+                       err.ecode, libc::EAGAIN);
+            }
+            _ => panic!("Unexpected response to Tlock: {:?}", exclusive_resp.body),
+        }
+
+        println!("✓ SQLite lock pattern with fid change works correctly");
+    }
+
+    #[tokio::test]
+    async fn test_lock_replacement_across_fids_same_session() {
+        // Test that locks can be replaced even when fid changes
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let lock_manager = Arc::new(FileLockManager::new());
+        let handler = NinePHandler::new(fs.clone(), lock_manager.clone());
+
+        // Setup
+        let version_msg = Message::Tversion(Tversion {
+            msize: 8192,
+            version: P9String::new(b"9P2000.L".to_vec()),
+        });
+        handler.handle_message(0, version_msg).await;
+
+        let attach_msg = Message::Tattach(Tattach {
+            fid: 1,
+            afid: u32::MAX,
+            uname: P9String::new(b"test".to_vec()),
+            aname: P9String::new(Vec::new()),
+            n_uname: 1000,
+        });
+        handler.handle_message(1, attach_msg).await;
+
+        // Create test file
+        let walk_msg = Message::Twalk(Twalk {
+            fid: 1,
+            newfid: 2,
+            nwname: 0,
+            wnames: vec![],
+        });
+        handler.handle_message(2, walk_msg).await;
+
+        let create_msg = Message::Tlcreate(Tlcreate {
+            fid: 2,
+            name: P9String::new(b"test.db".to_vec()),
+            flags: 0x8002,
+            mode: 0o644,
+            gid: 1000,
+        });
+        handler.handle_message(3, create_msg).await;
+
+        // Acquire lock with fid=2
+        let lock_msg = Message::Tlock(Tlock {
+            fid: 2,
+            lock_type: LockType::ReadLock,
+            flags: 0,
+            start: 0,
+            length: 100,
+            proc_id: 12345,
+            client_id: P9String::new(b"client".to_vec()),
+        });
+        handler.handle_message(4, lock_msg).await;
+
+        // Open same file with different fid (don't clunk fid=2)
+        let walk_msg = Message::Twalk(Twalk {
+            fid: 1,
+            newfid: 3,
+            nwname: 1,
+            wnames: vec![P9String::new(b"test.db".to_vec())],
+        });
+        handler.handle_message(5, walk_msg).await;
+
+        let open_msg = Message::Tlopen(Tlopen {
+            fid: 3,
+            flags: 0x8002,
+        });
+        handler.handle_message(6, open_msg).await;
+
+        // Try to acquire overlapping WRITE lock with fid=3
+        // According to POSIX, this should REPLACE the READ lock (same process)
+        let write_lock_msg = Message::Tlock(Tlock {
+            fid: 3,
+            lock_type: LockType::WriteLock,
+            flags: 0,
+            start: 50,  // Overlaps with previous lock
+            length: 100,
+            proc_id: 12345,
+            client_id: P9String::new(b"client".to_vec()),
+        });
+        let write_resp = handler.handle_message(7, write_lock_msg).await;
+
+        match &write_resp.body {
+            Message::Rlock(rlock) => {
+                assert_eq!(
+                    rlock.status,
+                    LockStatus::Success,
+                    "Failed to replace lock across fids - POSIX semantics violated!"
+                );
+            }
+            Message::Rlerror(err) => {
+                panic!("Lock replacement across fids failed: error code {}", err.ecode);
+            }
+            _ => panic!("Unexpected response: {:?}", write_resp.body),
+        }
+
+        println!("✓ Lock replacement works across different fids in same session");
+    }
+
+    #[tokio::test]
+    async fn test_unlock_across_fids() {
+        // Test that unlock works regardless of which fid acquired the lock
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let lock_manager = Arc::new(FileLockManager::new());
+        let handler = NinePHandler::new(fs.clone(), lock_manager.clone());
+
+        // Setup
+        let version_msg = Message::Tversion(Tversion {
+            msize: 8192,
+            version: P9String::new(b"9P2000.L".to_vec()),
+        });
+        handler.handle_message(0, version_msg).await;
+
+        let attach_msg = Message::Tattach(Tattach {
+            fid: 1,
+            afid: u32::MAX,
+            uname: P9String::new(b"test".to_vec()),
+            aname: P9String::new(Vec::new()),
+            n_uname: 1000,
+        });
+        handler.handle_message(1, attach_msg).await;
+
+        // Create test file
+        let walk_msg = Message::Twalk(Twalk {
+            fid: 1,
+            newfid: 2,
+            nwname: 0,
+            wnames: vec![],
+        });
+        handler.handle_message(2, walk_msg).await;
+
+        let create_msg = Message::Tlcreate(Tlcreate {
+            fid: 2,
+            name: P9String::new(b"test.db".to_vec()),
+            flags: 0x8002,
+            mode: 0o644,
+            gid: 1000,
+        });
+        handler.handle_message(3, create_msg).await;
+
+        // Acquire lock with fid=2
+        let lock_msg = Message::Tlock(Tlock {
+            fid: 2,
+            lock_type: LockType::WriteLock,
+            flags: 0,
+            start: 0,
+            length: 100,
+            proc_id: 12345,
+            client_id: P9String::new(b"client".to_vec()),
+        });
+        handler.handle_message(4, lock_msg).await;
+
+        // Open same file with different fid
+        let walk_msg = Message::Twalk(Twalk {
+            fid: 1,
+            newfid: 3,
+            nwname: 1,
+            wnames: vec![P9String::new(b"test.db".to_vec())],
+        });
+        handler.handle_message(5, walk_msg).await;
+
+        let open_msg = Message::Tlopen(Tlopen {
+            fid: 3,
+            flags: 0x8002,
+        });
+        handler.handle_message(6, open_msg).await;
+
+        // Try to unlock with different fid (fid=3)
+        let unlock_msg = Message::Tlock(Tlock {
+            fid: 3,
+            lock_type: LockType::Unlock,
+            flags: 0,
+            start: 0,
+            length: 100,
+            proc_id: 12345,
+            client_id: P9String::new(b"client".to_vec()),
+        });
+        let unlock_resp = handler.handle_message(7, unlock_msg).await;
+
+        assert!(matches!(unlock_resp.body, Message::Rlock(_)));
+
+        // Now try to acquire the lock from a DIFFERENT session
+        // This should succeed if the unlock worked
+        let handler2 = NinePHandler::new(fs.clone(), lock_manager.clone());
+
+        let version_msg = Message::Tversion(Tversion {
+            msize: 8192,
+            version: P9String::new(b"9P2000.L".to_vec()),
+        });
+        handler2.handle_message(0, version_msg).await;
+
+        let attach_msg = Message::Tattach(Tattach {
+            fid: 1,
+            afid: u32::MAX,
+            uname: P9String::new(b"test2".to_vec()),
+            aname: P9String::new(Vec::new()),
+            n_uname: 2000,  // Different user = different session
+        });
+        handler2.handle_message(1, attach_msg).await;
+
+        let walk_msg = Message::Twalk(Twalk {
+            fid: 1,
+            newfid: 4,
+            nwname: 1,
+            wnames: vec![P9String::new(b"test.db".to_vec())],
+        });
+        handler2.handle_message(2, walk_msg).await;
+
+        let open_msg = Message::Tlopen(Tlopen {
+            fid: 4,
+            flags: 0x8002,
+        });
+        handler2.handle_message(3, open_msg).await;
+
+        let lock_msg = Message::Tlock(Tlock {
+            fid: 4,
+            lock_type: LockType::WriteLock,
+            flags: 0,
+            start: 0,
+            length: 100,
+            proc_id: 67890,
+            client_id: P9String::new(b"client2".to_vec()),
+        });
+        let lock_resp = handler2.handle_message(4, lock_msg).await;
+
+        match &lock_resp.body {
+            Message::Rlock(rlock) => {
+                assert_eq!(
+                    rlock.status,
+                    LockStatus::Success,
+                    "Unlock didn't work across fids - old lock still held!"
+                );
+            }
+            Message::Rlerror(err) => {
+                panic!("Unlock across fids failed: error code {}", err.ecode);
+            }
+            _ => panic!("Unexpected response: {:?}", lock_resp.body),
+        }
+
+        println!("✓ Unlock works across different fids in same session");
     }
 }

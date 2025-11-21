@@ -1,4 +1,4 @@
-FROM rust:1.88-slim AS builder
+FROM rust:1.91-slim AS builder
 
 RUN apt-get update && apt-get install -y \
     pkg-config \
@@ -31,4 +31,4 @@ USER zerofs
 # Default ports that might be used - actual configuration comes from TOML file
 EXPOSE 2049 5564 10809
 
-ENTRYPOINT ["zerofs"]
+ENTRYPOINT ["bash"]

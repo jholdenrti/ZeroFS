@@ -42,7 +42,7 @@ pub const P9_MAX_GROUPS: usize = 16;
 pub const P9_NOBODY_UID: u32 = 65534;
 pub const P9_MAX_NAME_LEN: u32 = 255;
 
-#[derive(Debug, Clone, Copy, DekuRead, DekuWrite)]
+#[derive(Debug, Clone, Copy, PartialEq, DekuRead, DekuWrite)]
 #[deku(id_type = "u8")]
 pub enum LockStatus {
     #[deku(id = "0")]

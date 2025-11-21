@@ -49,12 +49,16 @@ impl FileLockManager {
 
         // First, remove any existing locks from this session that overlap
         // This implements POSIX lock replacement behavior
+        // POSIX semantics: locks are per-process (session), not per-fd (fid)
+        let mut to_remove = Vec::new();
+
+        // Collect lock_ids to remove (must drop the read reference before mutating)
         if let Some(lock_ids) = self.locks_by_session.get(&session_id) {
-            let mut to_remove = Vec::new();
             for lock_id in lock_ids.iter() {
                 if let Some(existing_lock) = self.locks.get(lock_id)
                     && existing_lock.inode_id == lock.inode_id
-                    && existing_lock.fid == lock.fid
+                    // Removed: && existing_lock.fid == lock.fid
+                    // Lock replacement works across all fids in the same session
                 {
                     let new_end = if lock.length == 0 {
                         u64::MAX
@@ -73,15 +77,16 @@ impl FileLockManager {
                     }
                 }
             }
+        } // Drop the read reference here
 
-            for lock_id in to_remove {
-                if let Some((_, old_lock)) = self.locks.remove(&lock_id) {
-                    if let Some(mut session_locks) = self.locks_by_session.get_mut(&session_id) {
-                        session_locks.retain(|id| id != &lock_id);
-                    }
-                    if let Some(mut inode_locks) = self.locks_by_inode.get_mut(&old_lock.inode_id) {
-                        inode_locks.retain(|id| id != &lock_id);
-                    }
+        // Now remove the locks (can safely get mutable references)
+        for lock_id in to_remove {
+            if let Some((_, old_lock)) = self.locks.remove(&lock_id) {
+                if let Some(mut session_locks) = self.locks_by_session.get_mut(&session_id) {
+                    session_locks.retain(|id| id != &lock_id);
+                }
+                if let Some(mut inode_locks) = self.locks_by_inode.get_mut(&old_lock.inode_id) {
+                    inode_locks.retain(|id| id != &lock_id);
                 }
             }
         }
@@ -110,7 +115,7 @@ impl FileLockManager {
     pub async fn unlock_range(
         &self,
         inode_id: InodeId,
-        fid: u32,
+        _fid: u32,
         start: u64,
         length: u64,
         session_id: u64,
@@ -126,11 +131,13 @@ impl FileLockManager {
         let mut locks_to_process = Vec::new();
 
         // Find locks that overlap with unlock range
+        // POSIX semantics: unlock works across all fids in the same session
         if let Some(lock_ids) = self.locks_by_session.get(&session_id) {
             for lock_id in lock_ids.iter() {
                 if let Some(lock) = self.locks.get(lock_id)
                     && lock.inode_id == inode_id
-                    && lock.fid == fid
+                    // Removed: && lock.fid == fid
+                    // Unlock works regardless of which fid acquired the lock
                 {
                     let lock_end = if lock.length == 0 {
                         u64::MAX
@@ -381,6 +388,38 @@ impl FileLockManager {
                     if let Some(mut inode_locks) = self.locks_by_inode.get_mut(&lock.inode_id) {
                         inode_locks.retain(|id| id != &lock_id);
                     }
+                }
+            }
+        }
+    }
+
+    pub async fn release_inode_locks(&self, inode_id: InodeId, session_id: u64) {
+        let _guard = self.lock_mutex.lock().await;
+
+        let mut to_remove = Vec::new();
+
+        // Find all locks from this session on this inode
+        // Clone the lock_ids to avoid holding a read reference while we mutate
+        if let Some(lock_ids) = self.locks_by_session.get(&session_id) {
+            for lock_id in lock_ids.iter() {
+                if let Some(lock) = self.locks.get(lock_id) {
+                    if lock.inode_id == inode_id {
+                        to_remove.push(*lock_id);
+                    }
+                }
+            }
+        } // Drop the read reference here
+
+        // Remove each lock
+        for lock_id in to_remove {
+            if let Some((_, lock)) = self.locks.remove(&lock_id) {
+                // Remove from session index
+                if let Some(mut session_locks) = self.locks_by_session.get_mut(&session_id) {
+                    session_locks.retain(|id| id != &lock_id);
+                }
+                // Remove from inode index
+                if let Some(mut inode_locks) = self.locks_by_inode.get_mut(&lock.inode_id) {
+                    inode_locks.retain(|id| id != &lock_id);
                 }
             }
         }
