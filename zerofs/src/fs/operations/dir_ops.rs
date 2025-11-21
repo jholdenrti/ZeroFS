@@ -251,10 +251,7 @@ impl ZeroFS {
                 }
                 .into();
 
-                // Release the write lock before caching to avoid deadlocks
-                drop(_guard);
-
-                // Cache the newly created inode to ensure it's available for immediate reads
+                // Cache the newly created inode BEFORE releasing lock to ensure it's available for immediate reads
                 // This is critical when await_durable=false, as the inode may not be
                 // visible in SlateDB yet. Without caching, load_inode() calls will fail
                 // with "inode key not found", especially with 9P cache=none.
@@ -272,6 +269,9 @@ impl ZeroFS {
                         CacheValue::DirEntry(new_dir_id),
                     )
                     .await;
+
+                // Now safe to release lock after cache updates are complete
+                drop(_guard);
 
                 Ok((new_dir_id, attrs))
             }

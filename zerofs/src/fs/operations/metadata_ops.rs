@@ -176,10 +176,7 @@ impl ZeroFS {
 
                         let attrs = InodeWithId { inode: &inode, id }.into();
 
-                        // Release write lock before caching
-                        drop(_guard);
-
-                        // Cache the updated inode to ensure size changes are immediately visible
+                        // Cache the updated inode BEFORE releasing lock to ensure size changes are immediately visible
                         // Critical for SQLite WAL mode with cache=none
                         use crate::fs::cache::{CacheKey, CacheValue};
                         self.cache
@@ -210,6 +207,9 @@ impl ZeroFS {
                                 .collect();
                             self.cache.remove_batch(keys_to_remove).await;
                         }
+
+                        // Now safe to release lock after cache updates are complete
+                        drop(_guard);
 
                         return Ok(attrs);
                     }
@@ -622,10 +622,7 @@ impl ZeroFS {
                     .into(),
                 );
 
-                // Release the write lock before caching to avoid deadlocks
-                drop(_guard);
-
-                // Cache the newly created inode to ensure it's available for immediate reads
+                // Cache the newly created inode BEFORE releasing lock to ensure it's available for immediate reads
                 // This is critical when await_durable=false, as the inode may not be
                 // visible in SlateDB yet. Without caching, load_inode() calls will fail
                 // with "inode key not found", especially with 9P cache=none.
@@ -644,6 +641,9 @@ impl ZeroFS {
                         CacheValue::DirEntry(special_id),
                     )
                     .await;
+
+                // Now safe to release lock after cache updates are complete
+                drop(_guard);
 
                 Ok(result)
             }
