@@ -205,7 +205,9 @@ impl ZeroFS {
                     self.global_stats.commit_update(&update);
                 }
 
-                let futures = vec![
+                // Invalidate all cache entries for the deleted file
+                // This includes metadata, directory entry, AND all chunks
+                let mut cache_keys = vec![
                     CacheKey::Metadata(file_id),
                     CacheKey::Metadata(dirid),
                     CacheKey::DirEntry {
@@ -214,7 +216,22 @@ impl ZeroFS {
                     },
                 ];
 
-                self.cache.remove_batch(futures).await;
+                // If this is a file being fully deleted (not just nlink decrement),
+                // also invalidate all its chunk cache entries
+                if let Inode::File(file) = &file_inode {
+                    if original_nlink <= 1 {
+                        // Calculate number of chunks to invalidate
+                        let total_chunks = file.size.div_ceil(CHUNK_SIZE as u64);
+                        for chunk_idx in 0..total_chunks {
+                            cache_keys.push(CacheKey::Chunk {
+                                inode_id: file_id,
+                                chunk_idx,
+                            });
+                        }
+                    }
+                }
+
+                self.cache.remove_batch(cache_keys).await;
 
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
