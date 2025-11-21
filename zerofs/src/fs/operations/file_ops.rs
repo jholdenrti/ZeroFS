@@ -212,13 +212,9 @@ impl ZeroFS {
                 self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
-                let attrs = InodeWithId { inode: &inode, id }.into();
-
-                // Release write lock before caching
-                drop(_guard);
-
-                // Cache the updated inode and chunks to ensure they're immediately visible
-                // Critical for SQLite WAL mode with cache=none and await_durable=false
+                // Cache the updated inode and chunks BEFORE releasing lock
+                // This prevents race condition where another thread reads before caching completes
+                // CRITICAL for SQLite WAL mode with cache=none and await_durable=false
                 use crate::fs::cache::{CacheKey, CacheValue};
                 self.cache
                     .insert(CacheKey::Metadata(id), CacheValue::Metadata(Arc::new(inode.clone())))
@@ -236,6 +232,11 @@ impl ZeroFS {
                         )
                         .await;
                 }
+
+                // Now safe to release write lock - all data is cached
+                drop(_guard);
+
+                let attrs = InodeWithId { inode: &inode, id }.into();
 
                 Ok(attrs)
             }
