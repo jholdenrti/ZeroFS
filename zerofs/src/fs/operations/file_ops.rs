@@ -108,6 +108,7 @@ impl ZeroFS {
                     .await;
 
                 let mut data_offset = 0;
+                let mut updated_chunks = Vec::new();
                 for chunk_idx in start_chunk..=end_chunk {
                     let chunk_start = chunk_idx as u64 * CHUNK_SIZE as u64;
                     let chunk_end = chunk_start + CHUNK_SIZE as u64;
@@ -133,7 +134,11 @@ impl ZeroFS {
                         .copy_from_slice(&data[data_offset..data_offset + data_len]);
                     data_offset += data_len;
 
-                    batch.put_bytes(&chunk_key, chunk.freeze());
+                    let chunk_bytes = chunk.freeze();
+                    batch.put_bytes(&chunk_key, chunk_bytes.clone());
+
+                    // Store for caching after lock is released
+                    updated_chunks.push((chunk_idx as u64, chunk_bytes));
                 }
 
                 debug!(
@@ -199,12 +204,25 @@ impl ZeroFS {
                 // Release write lock before caching
                 drop(_guard);
 
-                // Cache the updated inode to ensure size changes are immediately visible
-                // Critical for SQLite WAL mode with cache=none
-                use crate::fs::cache::CacheValue;
+                // Cache the updated inode and chunks to ensure they're immediately visible
+                // Critical for SQLite WAL mode with cache=none and await_durable=false
+                use crate::fs::cache::{CacheKey, CacheValue};
                 self.cache
                     .insert(CacheKey::Metadata(id), CacheValue::Metadata(Arc::new(inode.clone())))
                     .await;
+
+                // Cache all updated chunks
+                for (chunk_idx, chunk_data) in updated_chunks {
+                    self.cache
+                        .insert(
+                            CacheKey::Chunk {
+                                inode_id: id,
+                                chunk_idx,
+                            },
+                            CacheValue::Chunk(chunk_data),
+                        )
+                        .await;
+                }
 
                 Ok(attrs)
             }
@@ -422,8 +440,22 @@ impl ZeroFS {
                 let chunks: Vec<Bytes> = stream::iter(start_chunk..=end_chunk)
                     .map(|chunk_idx| {
                         let db = self.db.clone();
+                        let cache = self.cache.clone();
                         let key = KeyCodec::chunk_key(id, chunk_idx as u64);
                         async move {
+                            // Check cache first
+                            use crate::fs::cache::{CacheKey, CacheValue};
+                            if let Some(CacheValue::Chunk(cached_data)) = cache
+                                .get(CacheKey::Chunk {
+                                    inode_id: id,
+                                    chunk_idx: chunk_idx as u64,
+                                })
+                                .await
+                            {
+                                return cached_data;
+                            }
+
+                            // Fall back to database
                             db.get_bytes(&key)
                                 .await
                                 .ok()

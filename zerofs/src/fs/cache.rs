@@ -1,4 +1,5 @@
 use moka::future::{Cache, CacheBuilder};
+use bytes::Bytes;
 
 use super::inode::{Inode, InodeId};
 use std::sync::Arc;
@@ -9,12 +10,14 @@ const MAX_ENTRIES: u64 = 50_000;
 pub enum CacheKey {
     Metadata(InodeId),
     DirEntry { dir_id: InodeId, name: Vec<u8> },
+    Chunk { inode_id: InodeId, chunk_idx: u64 },
 }
 
 #[derive(Clone)]
 pub enum CacheValue {
     Metadata(Arc<Inode>),
     DirEntry(InodeId),
+    Chunk(Bytes),
 }
 
 #[derive(Clone)]

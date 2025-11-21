@@ -106,7 +106,7 @@ impl ZeroFS {
                             .new_write_batch()
                             .map_err(|_| FsError::ReadOnlyFilesystem)?;
 
-                        if new_size < old_size {
+                        let modified_chunk = if new_size < old_size {
                             let old_chunks = old_size.div_ceil(CHUNK_SIZE as u64) as usize;
                             let new_chunks = new_size.div_ceil(CHUNK_SIZE as u64) as usize;
 
@@ -131,10 +131,18 @@ impl ZeroFS {
 
                                     let mut new_chunk_data = old_chunk_data;
                                     new_chunk_data[clear_from..].fill(0);
-                                    batch.put_bytes(&key, Bytes::from(new_chunk_data));
+                                    let chunk_bytes = Bytes::from(new_chunk_data);
+                                    batch.put_bytes(&key, chunk_bytes.clone());
+                                    Some((last_chunk_idx as u64, chunk_bytes, new_chunks, old_chunks))
+                                } else {
+                                    Some((0, Bytes::new(), new_chunks, old_chunks))
                                 }
+                            } else {
+                                Some((0, Bytes::new(), new_chunks, old_chunks))
                             }
-                        }
+                        } else {
+                            None
+                        };
 
                         let inode_key = KeyCodec::inode_key(id);
                         let inode_data = bincode::serialize(&inode)?;
@@ -173,10 +181,35 @@ impl ZeroFS {
 
                         // Cache the updated inode to ensure size changes are immediately visible
                         // Critical for SQLite WAL mode with cache=none
-                        use crate::fs::cache::CacheValue;
+                        use crate::fs::cache::{CacheKey, CacheValue};
                         self.cache
                             .insert(CacheKey::Metadata(id), CacheValue::Metadata(Arc::new(inode.clone())))
                             .await;
+
+                        // Cache or remove chunks affected by truncation
+                        if let Some((last_chunk_idx, chunk_data, new_chunks, old_chunks)) = modified_chunk {
+                            // Cache the modified last chunk if it exists
+                            if !chunk_data.is_empty() {
+                                self.cache
+                                    .insert(
+                                        CacheKey::Chunk {
+                                            inode_id: id,
+                                            chunk_idx: last_chunk_idx,
+                                        },
+                                        CacheValue::Chunk(chunk_data),
+                                    )
+                                    .await;
+                            }
+
+                            // Remove deleted chunks from cache
+                            let keys_to_remove: Vec<CacheKey> = (new_chunks..old_chunks)
+                                .map(|chunk_idx| CacheKey::Chunk {
+                                    inode_id: id,
+                                    chunk_idx: chunk_idx as u64,
+                                })
+                                .collect();
+                            self.cache.remove_batch(keys_to_remove).await;
+                        }
 
                         return Ok(attrs);
                     }
