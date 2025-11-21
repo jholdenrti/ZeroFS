@@ -379,19 +379,11 @@ impl ZeroFS {
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
                 let inode = Inode::File(file_inode);
-                let file_attrs = InodeWithId {
-                    inode: &inode,
-                    id: file_id,
-                }
-                .into();
 
-                // Release the write lock before caching to avoid deadlocks
-                drop(_guard);
-
-                // Cache the newly created inode to ensure it's available for immediate reads
-                // This is critical when await_durable=false, as the inode may not be
-                // visible in SlateDB yet. Without caching, load_inode() calls will fail
-                // with "inode key not found", especially with 9P cache=none.
+                // Cache BEFORE releasing lock to prevent race condition
+                // CRITICAL: SQLite WAL mode creates files and immediately opens them
+                // If we release lock before caching, the immediate open will miss cache
+                // and query database (which may not have the entry yet with await_durable=false)
                 use crate::fs::cache::CacheValue;
                 self.cache
                     .insert(CacheKey::Metadata(file_id), CacheValue::Metadata(Arc::new(inode.clone())))
@@ -407,6 +399,15 @@ impl ZeroFS {
                         CacheValue::DirEntry(file_id),
                     )
                     .await;
+
+                // Now safe to release lock - file is fully cached and visible
+                drop(_guard);
+
+                let file_attrs = InodeWithId {
+                    inode: &inode,
+                    id: file_id,
+                }
+                .into();
 
                 Ok((file_id, file_attrs))
             }
