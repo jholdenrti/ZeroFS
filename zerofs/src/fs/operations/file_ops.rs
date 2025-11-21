@@ -90,15 +90,28 @@ impl ZeroFS {
 
                         let chunk_key = KeyCodec::chunk_key(id, chunk_idx as u64);
                         let db = self.db.clone();
+                        let cache = self.cache.clone();
                         async move {
                             let data = if will_overwrite_fully {
                                 Bytes::from(vec![0u8; CHUNK_SIZE])
                             } else {
-                                db.get_bytes(&chunk_key)
+                                // Check cache first before database
+                                use crate::fs::cache::{CacheKey, CacheValue};
+                                if let Some(CacheValue::Chunk(cached)) = cache
+                                    .get(CacheKey::Chunk {
+                                        inode_id: id,
+                                        chunk_idx: chunk_idx as u64,
+                                    })
                                     .await
-                                    .ok()
-                                    .flatten()
-                                    .unwrap_or_else(|| Bytes::from(vec![0u8; CHUNK_SIZE]))
+                                {
+                                    cached
+                                } else {
+                                    db.get_bytes(&chunk_key)
+                                        .await
+                                        .ok()
+                                        .flatten()
+                                        .unwrap_or_else(|| Bytes::from(vec![0u8; CHUNK_SIZE]))
+                                }
                             };
                             (chunk_idx, data)
                         }
