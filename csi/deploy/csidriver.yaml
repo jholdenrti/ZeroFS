@@ -1,0 +1,38 @@
+---
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: zerofs.csi.k8s.io
+spec:
+  # attachRequired indicates this driver does not require an attach operation
+  # Network filesystems like 9P can be mounted directly without attachment
+  attachRequired: false
+
+  # podInfoOnMount indicates that the driver needs pod information during mount
+  # Set to false as we get all needed info from volume context
+  podInfoOnMount: false
+
+  # volumeLifecycleModes defines what mode a volume can be used in
+  # Persistent means the volume has independent lifecycle from pods
+  volumeLifecycleModes:
+    - Persistent
+
+  # fsGroupPolicy controls if the driver supports fsGroup
+  # File means the driver supports fsGroup and will apply it to mounted volumes
+  fsGroupPolicy: File
+
+  # requiresRepublish indicates if the driver wants NodePublishVolume to be
+  # periodically called even if the volume is already mounted
+  requiresRepublish: false
+
+  # storageCapacity indicates if the driver supports storage capacity tracking
+  # We don't implement capacity tracking currently
+  storageCapacity: false
+
+  # tokenRequests is used for CSI token request
+  # Not needed for this driver
+  # tokenRequests: []
+
+  # seLinuxMount specifies if the driver supports mounting with SELinux context
+  # Set to false for initial implementation
+  seLinuxMount: false

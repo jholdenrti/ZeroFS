@@ -1,0 +1,198 @@
+# Example: Multiple PVs from one ZeroFS instance using path parameter
+# This demonstrates how one ZeroFS server can serve multiple volumes
+# by mounting different subdirectories
+
+---
+# ZeroFS Deployment - serves S3://my-bucket/
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zerofs-shared
+  namespace: zerofs-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zerofs-shared
+  template:
+    metadata:
+      labels:
+        app: zerofs-shared
+    spec:
+      containers:
+        - name: zerofs
+          image: zerofs:latest
+          ports:
+            - containerPort: 5564
+              name: ninep
+          env:
+            - name: STORAGE_URL
+              value: "s3://my-bucket/"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: s3-credentials
+                  key: access-key
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: s3-credentials
+                  key: secret-key
+            - name: ENCRYPTION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: zerofs-encryption
+                  key: password
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zerofs-shared
+  namespace: zerofs-system
+spec:
+  selector:
+    app: zerofs-shared
+  ports:
+    - port: 5564
+      name: ninep
+
+---
+# PV 1: App1 data - mounts /app1/data subdirectory
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: app1-data
+  labels:
+    app: app1
+    type: data
+spec:
+  capacity:
+    storage: 50Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: zerofs.csi.k8s.io
+    volumeHandle: app1-data
+    volumeAttributes:
+      server: "zerofs-shared.zerofs-system.svc.cluster.local"
+      # port: "5564"  # Optional - defaults to 5564
+      path: "/app1/data"  # Only this subdirectory is visible in pods
+---
+# PVC for App1 data
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app1-data
+  namespace: default
+spec:
+  volumeName: app1-data
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 50Gi
+
+---
+# PV 2: App2 logs - mounts /app2/logs subdirectory
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: app2-logs
+  labels:
+    app: app2
+    type: logs
+spec:
+  capacity:
+    storage: 20Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: zerofs.csi.k8s.io
+    volumeHandle: app2-logs
+    volumeAttributes:
+      server: "zerofs-shared.zerofs-system.svc.cluster.local"
+      path: "/app2/logs"  # Different subdirectory
+---
+# PVC for App2 logs
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app2-logs
+  namespace: default
+spec:
+  volumeName: app2-logs
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 20Gi
+
+---
+# PV 3: Shared storage - mounts /shared subdirectory
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: shared-storage
+  labels:
+    type: shared
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: zerofs.csi.k8s.io
+    volumeHandle: shared-storage
+    volumeAttributes:
+      server: "zerofs-shared.zerofs-system.svc.cluster.local"
+      path: "/shared"  # Shared directory accessible by multiple apps
+---
+# PVC for shared storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared-storage
+  namespace: default
+spec:
+  volumeName: shared-storage
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+
+---
+# PV 4: Root mount - no path specified, mounts entire volume
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: full-volume
+spec:
+  capacity:
+    storage: 200Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: zerofs.csi.k8s.io
+    volumeHandle: full-volume
+    volumeAttributes:
+      server: "zerofs-shared.zerofs-system.svc.cluster.local"
+      # No path = mount root directory
+---
+# PVC for full volume
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: full-volume
+  namespace: default
+spec:
+  volumeName: full-volume
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 200Gi

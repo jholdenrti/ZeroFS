@@ -1,0 +1,19 @@
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: zerofs-test-pod
+spec:
+  containers:
+    - name: test-container
+      image: busybox
+      command:
+        - sleep
+        - "3600"
+      volumeMounts:
+        - name: zerofs-volume
+          mountPath: /data
+  volumes:
+    - name: zerofs-volume
+      persistentVolumeClaim:
+        claimName: zerofs-pvc

@@ -1,0 +1,121 @@
+---
+# ConfigMap for ZeroFS configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zerofs-config
+  namespace: default
+data:
+  zerofs.toml: |
+    [storage]
+    # S3-compatible object store URL
+    # Replace with your actual S3 endpoint
+    url = "s3://my-bucket?endpoint=https://s3.amazonaws.com&region=us-east-1"
+
+    # Or use MinIO for testing
+    # url = "s3://zerofs-data?endpoint=http://minio:9000&region=us-east-1"
+
+    # Encryption password (use Kubernetes Secret in production!)
+    password = "change-me-in-production"
+
+    [servers.ninep]
+    # Listen on all interfaces for in-cluster access
+    addresses = ["0.0.0.0:5564"]
+
+    [cache]
+    # Adjust cache sizes based on your needs
+    disk_cache_size_mb = 1024
+    memory_cache_size_mb = 512
+
+---
+# StatefulSet for ZeroFS server
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: zerofs-server
+  namespace: default
+spec:
+  serviceName: zerofs-service
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zerofs-server
+  template:
+    metadata:
+      labels:
+        app: zerofs-server
+    spec:
+      containers:
+        - name: zerofs
+          # Replace with your ZeroFS image
+          image: zerofs:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /usr/local/bin/zerofs
+            - run
+            - -c
+            - /config/zerofs.toml
+          ports:
+            - name: ninep
+              containerPort: 5564
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: cache
+              mountPath: /cache
+          env:
+            # AWS credentials for S3 access
+            # Use Kubernetes Secrets in production!
+            - name: AWS_ACCESS_KEY_ID
+              value: "your-access-key"
+            - name: AWS_SECRET_ACCESS_KEY
+              value: "your-secret-key"
+          resources:
+            limits:
+              memory: 2Gi
+              cpu: 1000m
+            requests:
+              memory: 512Mi
+              cpu: 100m
+          livenessProbe:
+            tcpSocket:
+              port: 5564
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            tcpSocket:
+              port: 5564
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: config
+          configMap:
+            name: zerofs-config
+  volumeClaimTemplates:
+    - metadata:
+        name: cache
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+
+---
+# Service to expose ZeroFS server
+apiVersion: v1
+kind: Service
+metadata:
+  name: zerofs-service
+  namespace: default
+spec:
+  type: ClusterIP
+  selector:
+    app: zerofs-server
+  ports:
+    - name: ninep
+      protocol: TCP
+      port: 5564
+      targetPort: 5564
+  # Use headless service for StatefulSet
+  clusterIP: None

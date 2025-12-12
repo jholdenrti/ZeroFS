@@ -1,0 +1,35 @@
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: zerofs
+provisioner: zerofs.csi.k8s.io
+parameters:
+  # ZeroFS server address (required)
+  # Use the Kubernetes service name for in-cluster deployment
+  server: "zerofs-service.default.svc.cluster.local"
+
+  # 9P port (optional, default: 5564)
+  port: "5564"
+
+  # Base directory for volumes (optional, default: /volumes)
+  subdir: "/volumes"
+
+  # Temporary mount point for controller operations (optional)
+  # mountPoint: "/tmp/zerofs-csi-mount"
+
+# Mount options for 9P filesystem
+mountOptions:
+  - trans=tcp
+  - version=9p2000.L
+  - cache=mmap
+  - access=user
+
+# Reclaim policy: Delete or Retain
+reclaimPolicy: Delete
+
+# Volume binding mode: Immediate or WaitForFirstConsumer
+volumeBindingMode: Immediate
+
+# Allow volume expansion (not currently supported)
+allowVolumeExpansion: false

@@ -1,0 +1,137 @@
+# Example: Pods using PVs with path parameter
+# Each pod only sees its scoped subdirectory
+
+---
+# App1 Pod - sees only /app1/data from ZeroFS
+apiVersion: v1
+kind: Pod
+metadata:
+  name: app1-pod
+  namespace: default
+spec:
+  containers:
+    - name: app1
+      image: nginx
+      volumeMounts:
+        - name: data
+          mountPath: /data
+      command:
+        - sh
+        - -c
+        - |
+          echo "App1 container started"
+          echo "Writing to /data/test.txt"
+          echo "Hello from App1" > /data/test.txt
+          cat /data/test.txt
+          ls -la /data
+          tail -f /dev/null
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: app1-data  # Mounts /app1/data subdirectory
+
+---
+# App2 Pod - sees only /app2/logs from ZeroFS
+apiVersion: v1
+kind: Pod
+metadata:
+  name: app2-pod
+  namespace: default
+spec:
+  containers:
+    - name: app2
+      image: busybox
+      volumeMounts:
+        - name: logs
+          mountPath: /logs
+      command:
+        - sh
+        - -c
+        - |
+          echo "App2 container started"
+          while true; do
+            echo "$(date): App2 log entry" >> /logs/app2.log
+            sleep 5
+          done
+  volumes:
+    - name: logs
+      persistentVolumeClaim:
+        claimName: app2-logs  # Mounts /app2/logs subdirectory
+
+---
+# Multi-volume Pod - uses both shared storage and app-specific data
+apiVersion: v1
+kind: Pod
+metadata:
+  name: multi-volume-pod
+  namespace: default
+spec:
+  containers:
+    - name: app
+      image: alpine
+      volumeMounts:
+        - name: app-data
+          mountPath: /app/data
+        - name: shared
+          mountPath: /shared
+      command:
+        - sh
+        - -c
+        - |
+          echo "Multi-volume pod started"
+          echo "App data location: /app/data"
+          echo "Shared location: /shared"
+
+          # Write to app-specific data
+          echo "App-specific data" > /app/data/app.txt
+
+          # Write to shared storage
+          echo "Shared data from multi-volume-pod" > /shared/multi-volume.txt
+
+          # List both mounts
+          echo "=== /app/data ==="
+          ls -la /app/data
+          echo "=== /shared ==="
+          ls -la /shared
+
+          tail -f /dev/null
+  volumes:
+    - name: app-data
+      persistentVolumeClaim:
+        claimName: app1-data  # /app1/data
+    - name: shared
+      persistentVolumeClaim:
+        claimName: shared-storage  # /shared
+
+---
+# Read-only Pod - mounts shared storage in read-only mode
+apiVersion: v1
+kind: Pod
+metadata:
+  name: readonly-pod
+  namespace: default
+spec:
+  containers:
+    - name: reader
+      image: busybox
+      volumeMounts:
+        - name: shared
+          mountPath: /readonly
+          readOnly: true  # Read-only mount
+      command:
+        - sh
+        - -c
+        - |
+          echo "Read-only pod started"
+          echo "Can read shared data:"
+          cat /readonly/multi-volume.txt 2>/dev/null || echo "File not found yet"
+
+          echo "Cannot write (read-only):"
+          echo "test" > /readonly/test.txt 2>&1 || echo "Write failed as expected (read-only)"
+
+          tail -f /dev/null
+  volumes:
+    - name: shared
+      persistentVolumeClaim:
+        claimName: shared-storage
+        readOnly: true  # Request read-only access

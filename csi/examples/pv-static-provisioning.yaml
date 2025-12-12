@@ -1,0 +1,212 @@
+# Example: Static PV provisioning with automatic ZeroFS deployment creation
+# The CSI controller automatically creates/reuses ZeroFS deployments based on storage URL
+
+---
+# Secret containing S3 credentials
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3-credentials
+  namespace: zerofs-system
+type: Opaque
+stringData:
+  access-key-id: "YOUR_AWS_ACCESS_KEY_ID"
+  secret-access-key: "YOUR_AWS_SECRET_ACCESS_KEY"
+
+---
+# Secret containing encryption password
+apiVersion: v1
+kind: Secret
+metadata:
+  name: zerofs-encryption
+  namespace: zerofs-system
+type: Opaque
+stringData:
+  password: "your-encryption-password-here"
+
+---
+# Example 1: Dedicated S3 bucket for one application
+# Creates ZeroFS deployment: zerofs-<hash-of-url>
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: app1-dedicated-storage
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: zerofs.csi.k8s.io
+    volumeHandle: app1-dedicated-storage
+    volumeAttributes:
+      # Storage backend URL (required)
+      url: "s3://app1-bucket/"
+
+      # S3 configuration (optional)
+      region: "us-east-1"
+      # endpoint: "https://s3.amazonaws.com"  # Optional custom endpoint
+
+      # Credentials (optional - references Secret in zerofs-system namespace)
+      credentialsSecret: "s3-credentials"
+      encryptionSecret: "zerofs-encryption"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app1-data
+  namespace: default
+spec:
+  volumeName: app1-dedicated-storage
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+
+---
+# Example 2: Shared S3 bucket with path isolation
+# Same URL = same ZeroFS deployment, different paths = different volumes
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: shared-app2-data
+spec:
+  capacity:
+    storage: 50Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: zerofs.csi.k8s.io
+    volumeHandle: shared-app2-data
+    volumeAttributes:
+      url: "s3://shared-bucket/"
+      region: "us-east-1"
+      path: "/app2/data"  # Only this subdirectory visible in pods
+      credentialsSecret: "s3-credentials"
+      encryptionSecret: "zerofs-encryption"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app2-data
+  namespace: default
+spec:
+  volumeName: shared-app2-data
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 50Gi
+
+---
+# Example 3: Another PV using same shared bucket (reuses same ZeroFS deployment!)
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: shared-app3-logs
+spec:
+  capacity:
+    storage: 20Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: zerofs.csi.k8s.io
+    volumeHandle: shared-app3-logs
+    volumeAttributes:
+      url: "s3://shared-bucket/"  # Same URL as app2!
+      region: "us-east-1"
+      path: "/app3/logs"  # Different path
+      credentialsSecret: "s3-credentials"
+      encryptionSecret: "zerofs-encryption"
+      # This will reuse the ZeroFS deployment created for app2
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app3-logs
+  namespace: default
+spec:
+  volumeName: shared-app3-logs
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 20Gi
+
+---
+# Example 4: Azure Blob Storage
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: azure-storage
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: zerofs.csi.k8s.io
+    volumeHandle: azure-storage
+    volumeAttributes:
+      # Azure storage URL
+      url: "az://container-name/"
+
+      # Azure-specific: storage account name
+      storageAccountName: "mystorageaccount"
+
+      # Credentials secret should contain 'azure-storage-key'
+      credentialsSecret: "azure-credentials"
+      encryptionSecret: "zerofs-encryption"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: azure-data
+  namespace: default
+spec:
+  volumeName: azure-storage
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+
+---
+# Example 5: MinIO (S3-compatible) with custom endpoint
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: minio-storage
+spec:
+  capacity:
+    storage: 50Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: zerofs.csi.k8s.io
+    volumeHandle: minio-storage
+    volumeAttributes:
+      url: "s3://mybucket/"
+      endpoint: "http://minio.default.svc.cluster.local:9000"
+      region: "us-east-1"  # MinIO requires region even though it's ignored
+      credentialsSecret: "minio-credentials"
+      encryptionSecret: "zerofs-encryption"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-data
+  namespace: default
+spec:
+  volumeName: minio-storage
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 50Gi
