@@ -1,4 +1,5 @@
 use crate::bucket_identity;
+use crate::cache::FoyerCache;
 use crate::checkpoint_manager::CheckpointManager;
 use crate::config::{NbdConfig, NfsConfig, NinePConfig, RpcConfig, Settings};
 use crate::encryption::SlateDbHandle;
@@ -17,7 +18,6 @@ use slatedb::config::{
     CheckpointOptions, DbReaderOptions, GarbageCollectorDirectoryOptions, GarbageCollectorOptions,
     ObjectStoreCacheOptions,
 };
-use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::object_store::path::Path;
 use slatedb::{DbBuilder, DbReader};
 use std::path::PathBuf;
@@ -412,8 +412,8 @@ pub async fn build_slatedb(
     let settings = slatedb::config::Settings {
         wal_enabled: false,
         l0_max_ssts,
-        l0_sst_size_bytes: 256 * 1024 * 1024,
-        filter_bits_per_key: 20,
+        l0_sst_size_bytes: 128 * 1024 * 1024,
+        filter_bits_per_key: 10,
         object_store_cache_options: ObjectStoreCacheOptions {
             root_folder: Some(cache_config.root_folder.clone()),
             max_cache_size_bytes: Some(slatedb_object_cache_bytes),
@@ -424,7 +424,7 @@ pub async fn build_slatedb(
         max_unflushed_bytes,
         compactor_options: Some(slatedb::config::CompactorOptions {
             max_concurrent_compactions,
-            max_sst_size: 256 * 1024 * 1024,
+            max_sst_size: 1024 * 1024 * 1024,
             ..Default::default()
         }),
         compression_codec: None, // Disable compression - we handle it in encryption layer
@@ -445,11 +445,7 @@ pub async fn build_slatedb(
         ..Default::default()
     };
 
-    let cache = Arc::new(MokaCache::new_with_opts(MokaCacheOptions {
-        max_capacity: slatedb_memory_cache_bytes,
-        time_to_live: None,
-        time_to_idle: None,
-    }));
+    let cache = Arc::new(FoyerCache::new(slatedb_memory_cache_bytes as usize));
 
     let db_path = Path::from(db_path);
 
