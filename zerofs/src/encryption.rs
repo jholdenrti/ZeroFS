@@ -1,3 +1,5 @@
+use crate::config::CompressionConfig;
+use crate::fs::CHUNK_SIZE;
 use crate::fs::errors::FsError;
 use crate::fs::key_codec::KeyPrefix;
 use crate::task::spawn_blocking_named;
@@ -8,7 +10,6 @@ use chacha20poly1305::{
     Key, XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit},
 };
-use futures::stream::Stream;
 use hkdf::Hkdf;
 use rand::{RngCore, thread_rng};
 use sha2::Sha256;
@@ -19,8 +20,11 @@ use slatedb::{
 use std::ops::RangeBounds;
 use std::pin::Pin;
 use std::sync::Arc;
+use tokio_stream::Stream;
 
 const NONCE_SIZE: usize = 24;
+
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 /// Fatal handler for SlateDB write errors.
 /// After a write failure, the database state is unknown - exit and let
@@ -33,10 +37,11 @@ pub fn exit_on_write_error(err: impl std::fmt::Display) -> ! {
 #[derive(Clone)]
 pub struct EncryptionManager {
     cipher: XChaCha20Poly1305,
+    compression: CompressionConfig,
 }
 
 impl EncryptionManager {
-    pub fn new(master_key: &[u8; 32]) -> Self {
+    pub fn new(master_key: &[u8; 32], compression: CompressionConfig) -> Self {
         let hk = Hkdf::<Sha256>::new(None, master_key);
 
         let mut encryption_key = [0u8; 32];
@@ -46,6 +51,7 @@ impl EncryptionManager {
 
         Self {
             cipher: XChaCha20Poly1305::new(Key::from_slice(&encryption_key)),
+            compression,
         }
     }
 
@@ -57,7 +63,11 @@ impl EncryptionManager {
         // Check if this is a chunk key to decide on compression
         let data =
             if key.first().and_then(|&b| KeyPrefix::try_from(b).ok()) == Some(KeyPrefix::Chunk) {
-                lz4_flex::compress_prepend_size(plaintext)
+                match self.compression {
+                    CompressionConfig::Lz4 => lz4_flex::compress_prepend_size(plaintext),
+                    CompressionConfig::Zstd(level) => zstd::bulk::compress(plaintext, level)
+                        .map_err(|e| anyhow::anyhow!("Zstd compression failed: {}", e))?,
+                }
             } else {
                 plaintext.to_vec()
             };
@@ -89,10 +99,14 @@ impl EncryptionManager {
             .decrypt(nonce, ciphertext)
             .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
 
-        // Decompress chunks
         if key.first().and_then(|&b| KeyPrefix::try_from(b).ok()) == Some(KeyPrefix::Chunk) {
-            lz4_flex::decompress_size_prepended(&decrypted)
-                .map_err(|e| anyhow::anyhow!("Decompression failed: {}", e))
+            if decrypted.len() >= 4 && decrypted[..4] == ZSTD_MAGIC {
+                zstd::bulk::decompress(&decrypted, CHUNK_SIZE)
+                    .map_err(|e| anyhow::anyhow!("Zstd decompression failed: {}", e))
+            } else {
+                lz4_flex::decompress_size_prepended(&decrypted)
+                    .map_err(|e| anyhow::anyhow!("LZ4 decompression failed: {}", e))
+            }
         } else {
             Ok(decrypted)
         }
@@ -236,12 +250,18 @@ impl EncryptedDb {
 
         match encrypted {
             Some(encrypted) => {
-                let encryptor = self.encryptor.clone();
-                let key = key.clone();
-                let decrypted =
+                let is_chunk = key.first().and_then(|&b| KeyPrefix::try_from(b).ok())
+                    == Some(KeyPrefix::Chunk);
+
+                let decrypted = if is_chunk {
+                    let encryptor = self.encryptor.clone();
+                    let key = key.clone();
                     spawn_blocking_named("decrypt", move || encryptor.decrypt(&key, &encrypted))
                         .await
-                        .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
+                        .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??
+                } else {
+                    self.encryptor.decrypt(key, &encrypted)?
+                };
                 Ok(Some(bytes::Bytes::from(decrypted)))
             }
             None => Ok(None),
@@ -268,41 +288,36 @@ impl EncryptedDb {
             }
         };
 
-        Ok(Box::pin(futures::stream::unfold(
-            (iter, encryptor),
-            |(mut iter, encryptor)| async move {
-                match iter.next().await {
-                    Ok(Some(kv)) => {
-                        let key = kv.key;
-                        let encrypted_value = kv.value;
+        let (tx_in, mut rx_in) = tokio::sync::mpsc::channel::<(Bytes, Bytes)>(32);
+        let (tx_out, rx_out) = tokio::sync::mpsc::channel::<Result<(Bytes, Bytes)>>(32);
 
-                        // Skip decryption for system keys that use different encryption
-                        // (wrapped_encryption_key uses password-derived encryption)
-                        if key.as_ref() == crate::fs::key_codec::SYSTEM_WRAPPED_ENCRYPTION_KEY {
-                            return Some((Ok((key, encrypted_value)), (iter, encryptor)));
-                        }
-
-                        match encryptor.decrypt(&key, &encrypted_value) {
-                            Ok(decrypted) => {
-                                Some((Ok((key, Bytes::from(decrypted))), (iter, encryptor)))
-                            }
-                            Err(e) => Some((
-                                Err(anyhow::anyhow!(
-                                    "Decryption failed for key {:?}: {}",
-                                    key,
-                                    e
-                                )),
-                                (iter, encryptor),
-                            )),
-                        }
-                    }
-                    Ok(None) => None,
-                    Err(e) => Some((
-                        Err(anyhow::anyhow!("Iterator error: {}", e)),
-                        (iter, encryptor),
-                    )),
+        spawn_blocking_named("scan-decrypt", move || {
+            while let Some((key, encrypted)) = rx_in.blocking_recv() {
+                let result = if key.as_ref() == crate::fs::key_codec::SYSTEM_WRAPPED_ENCRYPTION_KEY
+                {
+                    Ok((key, encrypted))
+                } else {
+                    encryptor
+                        .decrypt(&key, &encrypted)
+                        .map(|dec| (key, Bytes::from(dec)))
+                };
+                if tx_out.blocking_send(result).is_err() {
+                    break;
                 }
-            },
+            }
+        });
+
+        tokio::spawn(async move {
+            let mut iter = iter;
+            while let Ok(Some(kv)) = iter.next().await {
+                if tx_in.send((kv.key, kv.value)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
+            rx_out,
         )))
     }
 
@@ -366,13 +381,19 @@ impl EncryptedDb {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
 
-        let encryptor = self.encryptor.clone();
-        let key_clone = key.clone();
-        let value = value.to_vec();
-        let encrypted =
+        let is_chunk =
+            key.first().and_then(|&b| KeyPrefix::try_from(b).ok()) == Some(KeyPrefix::Chunk);
+
+        let encrypted = if is_chunk {
+            let encryptor = self.encryptor.clone();
+            let key_clone = key.clone();
+            let value = value.to_vec();
             spawn_blocking_named("encrypt", move || encryptor.encrypt(&key_clone, &value))
                 .await
-                .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
+                .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??
+        } else {
+            self.encryptor.encrypt(key, value)?
+        };
 
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => {
@@ -417,5 +438,117 @@ impl EncryptedDb {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::key_codec::KeyCodec;
+
+    fn chunk_key() -> Vec<u8> {
+        KeyCodec::chunk_key(1, 0).to_vec()
+    }
+
+    fn non_chunk_key() -> Vec<u8> {
+        KeyCodec::inode_key(1).to_vec()
+    }
+
+    #[test]
+    fn test_lz4_compress_decompress() {
+        let manager = EncryptionManager::new(&[0u8; 32], CompressionConfig::Lz4);
+        let plaintext = vec![0u8; 1024];
+        let key = chunk_key();
+
+        let encrypted = manager.encrypt(&key, &plaintext).unwrap();
+        let decrypted = manager.decrypt(&key, &encrypted).unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_zstd_compress_decompress() {
+        let manager = EncryptionManager::new(&[0u8; 32], CompressionConfig::Zstd(3));
+        let plaintext = vec![0u8; 1024];
+        let key = chunk_key();
+
+        let encrypted = manager.encrypt(&key, &plaintext).unwrap();
+        let decrypted = manager.decrypt(&key, &encrypted).unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_zstd_high_level_compress_decompress() {
+        let manager = EncryptionManager::new(&[0u8; 32], CompressionConfig::Zstd(19));
+        let plaintext = vec![42u8; 8192];
+        let key = chunk_key();
+
+        let encrypted = manager.encrypt(&key, &plaintext).unwrap();
+        let decrypted = manager.decrypt(&key, &encrypted).unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_cross_algorithm_lz4_written_zstd_configured() {
+        // Write with lz4
+        let lz4_manager = EncryptionManager::new(&[0u8; 32], CompressionConfig::Lz4);
+        let plaintext = vec![1u8; 2048];
+        let key = chunk_key();
+
+        let encrypted = lz4_manager.encrypt(&key, &plaintext).unwrap();
+
+        // Read with zstd configured - should auto-detect lz4
+        let zstd_manager = EncryptionManager::new(&[0u8; 32], CompressionConfig::Zstd(3));
+        let decrypted = zstd_manager.decrypt(&key, &encrypted).unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_cross_algorithm_zstd_written_lz4_configured() {
+        // Write with zstd
+        let zstd_manager = EncryptionManager::new(&[0u8; 32], CompressionConfig::Zstd(5));
+        let plaintext = vec![2u8; 2048];
+        let key = chunk_key();
+
+        let encrypted = zstd_manager.encrypt(&key, &plaintext).unwrap();
+
+        // Read with lz4 configured - should auto-detect zstd
+        let lz4_manager = EncryptionManager::new(&[0u8; 32], CompressionConfig::Lz4);
+        let decrypted = lz4_manager.decrypt(&key, &encrypted).unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_non_chunk_data_not_compressed() {
+        let manager = EncryptionManager::new(&[0u8; 32], CompressionConfig::Zstd(3));
+        let plaintext = b"metadata content".to_vec();
+        let key = non_chunk_key();
+
+        let encrypted = manager.encrypt(&key, &plaintext).unwrap();
+        let decrypted = manager.decrypt(&key, &encrypted).unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_zstd_magic_detection() {
+        // Verify zstd compressed data starts with magic bytes
+        let data = vec![0u8; 1024];
+        let compressed = zstd::bulk::compress(&data, 3).unwrap();
+
+        assert!(compressed.starts_with(&ZSTD_MAGIC));
+    }
+
+    #[test]
+    fn test_lz4_no_zstd_magic() {
+        // Verify lz4 compressed data does NOT start with zstd magic
+        let data = vec![0u8; 1024];
+        let compressed = lz4_flex::compress_prepend_size(&data);
+
+        assert!(!compressed.starts_with(&ZSTD_MAGIC));
     }
 }
