@@ -36,4 +36,4 @@ USER zerofs
 # Default ports that might be used - actual configuration comes from TOML file
 EXPOSE 2049 5564 10809
 
-ENTRYPOINT ["bash"]
+CMD ["zerofs"]
