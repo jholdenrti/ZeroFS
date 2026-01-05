@@ -377,6 +377,7 @@ pub async fn build_slatedb(
     db_path: String,
     db_mode: DatabaseMode,
     lsm_config: Option<crate::config::LsmConfig>,
+    disable_compactor: bool,
 ) -> Result<(
     SlateDbHandle,
     Option<CheckpointRefreshParams>,
@@ -410,6 +411,16 @@ pub async fn build_slatedb(
         .map(|c| c.max_concurrent_compactions())
         .unwrap_or(crate::config::LsmConfig::DEFAULT_MAX_CONCURRENT_COMPACTIONS);
 
+    let compactor_options = if disable_compactor {
+        None
+    } else {
+        Some(slatedb::config::CompactorOptions {
+            max_concurrent_compactions,
+            max_sst_size: 1024 * 1024 * 1024,
+            ..Default::default()
+        })
+    };
+
     let settings = slatedb::config::Settings {
         wal_enabled: false,
         l0_max_ssts,
@@ -423,11 +434,7 @@ pub async fn build_slatedb(
         },
         flush_interval: Some(std::time::Duration::from_secs(30)),
         max_unflushed_bytes,
-        compactor_options: Some(slatedb::config::CompactorOptions {
-            max_concurrent_compactions,
-            max_sst_size: 1024 * 1024 * 1024,
-            ..Default::default()
-        }),
+        compactor_options,
         compression_codec: None, // Disable compression - we handle it in encryption layer
         garbage_collector_options: Some(GarbageCollectorOptions {
             wal_options: Some(GarbageCollectorDirectoryOptions {
@@ -439,6 +446,10 @@ pub async fn build_slatedb(
                 min_age: Duration::from_mins(1),
             }),
             compacted_options: Some(GarbageCollectorDirectoryOptions {
+                interval: Some(Duration::from_mins(1)),
+                min_age: Duration::from_mins(1),
+            }),
+            compactions_options: Some(GarbageCollectorDirectoryOptions {
                 interval: Some(Duration::from_mins(1)),
                 min_age: Duration::from_mins(1),
             }),
@@ -465,26 +476,32 @@ pub async fn build_slatedb(
 
     match db_mode {
         DatabaseMode::ReadWrite => {
-            info!("Opening database in read-write mode");
+            if disable_compactor {
+                info!("Opening database in read-write mode (compactor disabled)");
+            } else {
+                info!("Opening database in read-write mode");
+            }
 
-            let slatedb = Arc::new(
-                DbBuilder::new(db_path, object_store)
-                    .with_settings(settings)
-                    .with_gc_runtime(runtime_handle.clone())
+            let mut builder = DbBuilder::new(db_path, object_store)
+                .with_settings(settings)
+                .with_gc_runtime(runtime_handle.clone())
+                .with_memory_cache(cache);
+
+            if !disable_compactor {
+                builder = builder
                     .with_compaction_runtime(runtime_handle.clone())
                     .with_compaction_scheduler_supplier(Arc::new(
                         SizeTieredCompactionSchedulerSupplier::new(
                             SizeTieredCompactionSchedulerOptions {
                                 max_compaction_sources: 32,
-                                include_size_threshold: 2.0,
+                                include_size_threshold: 4.0,
                                 ..Default::default()
                             },
                         ),
-                    ))
-                    .with_memory_cache(cache)
-                    .build()
-                    .await?,
-            );
+                    ));
+            }
+
+            let slatedb = Arc::new(builder.build().await?);
 
             Ok((
                 SlateDbHandle::ReadWrite(slatedb),
@@ -559,7 +576,11 @@ pub struct InitResult {
     pub maintenance_runtime: Option<tokio::runtime::Handle>,
 }
 
-async fn initialize_filesystem(settings: &Settings, db_mode: DatabaseMode) -> Result<InitResult> {
+async fn initialize_filesystem(
+    settings: &Settings,
+    db_mode: DatabaseMode,
+    disable_compactor: bool,
+) -> Result<InitResult> {
     let url = settings.storage.url.clone();
 
     let cache_config = CacheConfig {
@@ -616,6 +637,7 @@ async fn initialize_filesystem(settings: &Settings, db_mode: DatabaseMode) -> Re
         actual_db_path.clone(),
         db_mode,
         settings.lsm,
+        disable_compactor,
     )
     .await?;
 
@@ -644,6 +666,7 @@ pub async fn run_server(
     config_path: PathBuf,
     read_only: bool,
     checkpoint_name: Option<String>,
+    no_compactor: bool,
 ) -> Result<()> {
     use tracing_subscriber::EnvFilter;
 
@@ -688,7 +711,7 @@ pub async fn run_server(
         }
     };
 
-    let init_result = initialize_filesystem(&settings, db_mode).await?;
+    let init_result = initialize_filesystem(&settings, db_mode, no_compactor).await?;
     let fs = init_result.fs;
     let checkpoint_params = init_result.checkpoint_params;
 
