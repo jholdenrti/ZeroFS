@@ -1,0 +1,27 @@
+FROM ubuntu:24.04
+
+ARG TARGETARCH
+
+RUN apt-get update && apt-get install -y \
+   ca-certificates \
+   libssl3 \
+   wget \
+   && rm -rf /var/lib/apt/lists/*
+
+RUN wget https://github.com/Barre/ZeroFS/releases/download/v0.22.11/zerofs-pgo-multiplatform.tar.gz -O /tmp/zerofs.tar.gz && \
+    tar -xzf /tmp/zerofs.tar.gz -C /tmp && \
+    if [ "$TARGETARCH" = "amd64" ]; then \
+        cp /tmp/zerofs-linux-amd64-pgo /usr/local/bin/zerofs; \
+    elif [ "$TARGETARCH" = "arm64" ]; then \
+        cp /tmp/zerofs-linux-arm64-pgo /usr/local/bin/zerofs; \
+    else \
+        echo "Unsupported architecture: $TARGETARCH" && exit 1; \
+    fi && \
+    chmod +x /usr/local/bin/zerofs && \
+    rm -rf /tmp/zerofs*
+
+# Default ports that might be used - actual configuration comes from TOML file
+EXPOSE 2049 5564 10809
+
+CMD ["zerofs"]
+
