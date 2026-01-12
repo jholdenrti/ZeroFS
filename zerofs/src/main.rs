@@ -1,13 +1,14 @@
 use anyhow::{Context, Result};
 use std::io::BufRead;
 
+mod block_transformer;
 mod bucket_identity;
 mod cache;
 mod checkpoint_manager;
 mod cli;
 mod config;
+mod db;
 mod deku_bytes;
-mod encryption;
 mod fs;
 mod key_management;
 mod nbd;
@@ -27,12 +28,10 @@ mod posix_tests;
 #[cfg(feature = "failpoints")]
 mod failpoints;
 
-#[cfg(not(target_env = "msvc"))]
-use tikv_jemallocator::Jemalloc;
+use mimalloc::MiMalloc;
 
-#[cfg(not(target_env = "msvc"))]
 #[global_allocator]
-static GLOBAL: Jemalloc = Jemalloc;
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -109,6 +108,9 @@ async fn main() -> Result<()> {
         }
         cli::Commands::Compactor { config } => {
             cli::compactor::run_compactor(config).await?;
+        }
+        cli::Commands::Flush { config } => {
+            cli::flush::flush(&config).await?;
         }
     }
 

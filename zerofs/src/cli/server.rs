@@ -1,8 +1,10 @@
+use crate::block_transformer::ZeroFsBlockTransformer;
 use crate::bucket_identity;
 use crate::cache::FoyerCache;
 use crate::checkpoint_manager::CheckpointManager;
 use crate::config::{NbdConfig, NfsConfig, NinePConfig, RpcConfig, Settings};
-use crate::encryption::SlateDbHandle;
+use crate::db::SlateDbHandle;
+use crate::fs::flush_coordinator::FlushCoordinator;
 use crate::fs::permissions::Credentials;
 use crate::fs::tracing::AccessTracer;
 use crate::fs::types::SetAttributes;
@@ -20,7 +22,7 @@ use slatedb::config::{
 };
 use slatedb::object_store::path::Path;
 use slatedb::size_tiered_compaction::SizeTieredCompactionSchedulerSupplier;
-use slatedb::{DbBuilder, DbReader};
+use slatedb::{BlockTransformer, DbBuilder, DbReader};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -210,6 +212,7 @@ async fn start_nbd_servers(
 async fn start_rpc_servers(
     config: Option<&RpcConfig>,
     checkpoint_manager: Arc<CheckpointManager>,
+    flush_coordinator: FlushCoordinator,
     tracer: AccessTracer,
     shutdown: CancellationToken,
 ) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
@@ -218,7 +221,8 @@ async fn start_rpc_servers(
         None => return Vec::new(),
     };
 
-    let service = crate::rpc::server::AdminRpcServer::new(checkpoint_manager, tracer);
+    let service =
+        crate::rpc::server::AdminRpcServer::new(checkpoint_manager, flush_coordinator, tracer);
     let mut handles = Vec::new();
 
     if let Some(addresses) = &config.addresses {
@@ -304,7 +308,8 @@ pub struct CheckpointRefreshParams {
 
 fn start_checkpoint_refresh(
     params: CheckpointRefreshParams,
-    encrypted_db: Arc<crate::encryption::EncryptedDb>,
+    db: Arc<crate::db::Db>,
+    block_transformer: Arc<dyn slatedb::BlockTransformer>,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     let db_path = params.db_path;
@@ -341,12 +346,15 @@ fn start_checkpoint_refresh(
                                 db_path.clone(),
                                 object_store.clone(),
                                 Some(checkpoint_result.id),
-                                DbReaderOptions::default(),
+                                DbReaderOptions {
+                                    block_transformer: Some(block_transformer.clone()),
+                                    ..Default::default()
+                                },
                             )
                             .await
                             {
                                 Ok(new_reader) => {
-                                    if let Err(e) = encrypted_db.swap_reader(Arc::new(new_reader)) {
+                                    if let Err(e) = db.swap_reader(Arc::new(new_reader)) {
                                         tracing::error!("Failed to swap reader: {:?}", e);
                                         continue;
                                     }
@@ -378,6 +386,7 @@ pub async fn build_slatedb(
     db_mode: DatabaseMode,
     lsm_config: Option<crate::config::LsmConfig>,
     disable_compactor: bool,
+    block_transformer: Arc<dyn BlockTransformer>,
 ) -> Result<(
     SlateDbHandle,
     Option<CheckpointRefreshParams>,
@@ -416,7 +425,7 @@ pub async fn build_slatedb(
     } else {
         Some(slatedb::config::CompactorOptions {
             max_concurrent_compactions,
-            max_sst_size: 1024 * 1024 * 1024,
+            max_sst_size: 256 * 1024 * 1024,
             ..Default::default()
         })
     };
@@ -485,7 +494,9 @@ pub async fn build_slatedb(
             let mut builder = DbBuilder::new(db_path, object_store)
                 .with_settings(settings)
                 .with_gc_runtime(runtime_handle.clone())
-                .with_memory_cache(cache);
+                .with_sst_block_size(slatedb::SstBlockSize::Block4Kib)
+                .with_memory_cache(cache)
+                .with_block_transformer(block_transformer);
 
             if !disable_compactor {
                 builder = builder
@@ -528,12 +539,16 @@ pub async fn build_slatedb(
             );
 
             let db_path_str = db_path.to_string();
+            let reader_options = DbReaderOptions {
+                block_transformer: Some(block_transformer),
+                ..Default::default()
+            };
             let reader = Arc::new(
                 DbReader::open(
                     db_path,
                     object_store.clone(),
                     Some(checkpoint_result.id),
-                    DbReaderOptions::default(),
+                    reader_options,
                 )
                 .await?,
             );
@@ -552,14 +567,12 @@ pub async fn build_slatedb(
         DatabaseMode::Checkpoint(checkpoint_id) => {
             info!("Opening database from checkpoint ID: {}", checkpoint_id);
 
+            let reader_options = DbReaderOptions {
+                block_transformer: Some(block_transformer),
+                ..Default::default()
+            };
             let reader = Arc::new(
-                DbReader::open(
-                    db_path,
-                    object_store,
-                    Some(checkpoint_id),
-                    DbReaderOptions::default(),
-                )
-                .await?,
+                DbReader::open(db_path, object_store, Some(checkpoint_id), reader_options).await?,
             );
 
             Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None, None))
@@ -574,6 +587,7 @@ pub struct InitResult {
     pub db_path: String,
     pub db_handle: SlateDbHandle,
     pub maintenance_runtime: Option<tokio::runtime::Handle>,
+    pub block_transformer: Arc<dyn BlockTransformer>,
 }
 
 async fn initialize_filesystem(
@@ -629,7 +643,19 @@ async fn initialize_filesystem(
     super::password::validate_password(&password)
         .map_err(|e| anyhow::anyhow!("Password validation failed: {}", e))?;
 
-    info!("Loading or initializing encryption key");
+    info!("Loading or initializing encryption key from object store");
+
+    let db_path = Path::from(actual_db_path.clone());
+    let encryption_key = key_management::load_or_init_encryption_key(
+        &object_store,
+        &db_path,
+        &password,
+        db_mode.is_read_only(),
+    )
+    .await?;
+
+    let block_transformer: Arc<dyn BlockTransformer> =
+        ZeroFsBlockTransformer::new_arc(&encryption_key, settings.compression());
 
     let (slatedb, checkpoint_params, maintenance_runtime) = build_slatedb(
         object_store.clone(),
@@ -638,19 +664,12 @@ async fn initialize_filesystem(
         db_mode,
         settings.lsm,
         disable_compactor,
+        block_transformer.clone(),
     )
     .await?;
-
-    let encryption_key = key_management::load_or_init_encryption_key(&slatedb, &password).await?;
 
     let db_handle = slatedb.clone();
-    let fs = ZeroFS::new_with_slatedb(
-        slatedb,
-        encryption_key,
-        settings.max_bytes(),
-        settings.compression(),
-    )
-    .await?;
+    let fs = ZeroFS::new_with_slatedb(slatedb, settings.max_bytes()).await?;
 
     Ok(InitResult {
         fs: Arc::new(fs),
@@ -659,6 +678,7 @@ async fn initialize_filesystem(
         db_path: actual_db_path,
         db_handle,
         maintenance_runtime,
+        block_transformer,
     })
 }
 
@@ -750,6 +770,7 @@ pub async fn run_server(
     let rpc_handles = start_rpc_servers(
         settings.servers.rpc.as_ref(),
         checkpoint_manager,
+        fs.flush_coordinator.clone(),
         fs.tracer.clone(),
         shutdown.clone(),
     )
@@ -781,8 +802,14 @@ pub async fn run_server(
         None
     };
 
-    let checkpoint_handle = checkpoint_params
-        .map(|params| start_checkpoint_refresh(params, Arc::clone(&fs.db), shutdown.clone()));
+    let checkpoint_handle = checkpoint_params.map(|params| {
+        start_checkpoint_refresh(
+            params,
+            Arc::clone(&fs.db),
+            init_result.block_transformer.clone(),
+            shutdown.clone(),
+        )
+    });
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
