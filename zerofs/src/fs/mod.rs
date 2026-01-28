@@ -556,14 +556,17 @@ impl ZeroFS {
         );
 
         let _guard = self.lock_manager.acquire(dirid).await;
-        let mut dir_inode = self.inode_store.get(dirid).await?;
+        let (mut dir_inode, exists) = tokio::try_join!(
+            self.inode_store.get(dirid),
+            self.directory_store.exists(dirid, name)
+        )?;
 
         check_access(&dir_inode, creds, AccessMode::Write)?;
         check_access(&dir_inode, creds, AccessMode::Execute)?;
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
-                if self.directory_store.exists(dirid, name).await? {
+                if exists {
                     return Err(FsError::Exists);
                 }
 
@@ -823,13 +826,18 @@ impl ZeroFS {
             String::from_utf8_lossy(filename)
         );
 
-        let dir_inode = self.inode_store.get(dirid).await?;
+        let (dir_inode_result, entry_result) = tokio::join!(
+            self.inode_store.get(dirid),
+            self.directory_store.get(dirid, filename)
+        );
+
+        let dir_inode = dir_inode_result?;
 
         match dir_inode {
             Inode::Directory(_) => {
                 check_access(&dir_inode, creds, AccessMode::Execute)?;
 
-                match self.directory_store.get(dirid, filename).await {
+                match entry_result {
                     Ok(inode_id) => {
                         debug!(
                             "lookup found: {} -> inode {}",
@@ -878,14 +886,17 @@ impl ZeroFS {
         );
 
         let _guard = self.lock_manager.acquire(dirid).await;
-        let mut dir_inode = self.inode_store.get(dirid).await?;
+        let (mut dir_inode, exists) = tokio::try_join!(
+            self.inode_store.get(dirid),
+            self.directory_store.exists(dirid, name)
+        )?;
 
         check_access(&dir_inode, creds, AccessMode::Write)?;
         check_access(&dir_inode, creds, AccessMode::Execute)?;
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
-                if self.directory_store.exists(dirid, name).await? {
+                if exists {
                     return Err(FsError::Exists);
                 }
 
@@ -1202,7 +1213,10 @@ impl ZeroFS {
         );
 
         let _guard = self.lock_manager.acquire(dirid).await;
-        let mut dir_inode = self.inode_store.get(dirid).await?;
+        let (mut dir_inode, exists) = tokio::try_join!(
+            self.inode_store.get(dirid),
+            self.directory_store.exists(dirid, linkname)
+        )?;
 
         check_access(&dir_inode, creds, AccessMode::Write)?;
         check_access(&dir_inode, creds, AccessMode::Execute)?;
@@ -1212,7 +1226,7 @@ impl ZeroFS {
             _ => return Err(FsError::NotDirectory),
         };
 
-        if self.directory_store.exists(dirid, linkname).await? {
+        if exists {
             return Err(FsError::Exists);
         }
 
@@ -1344,8 +1358,13 @@ impl ZeroFS {
             .acquire_multi(vec![fileid, linkdirid])
             .await;
 
-        let link_dir_inode = self.inode_store.get(linkdirid).await?;
         let creds = Credentials::from_auth_context(auth);
+
+        let (link_dir_inode, mut file_inode, exists) = tokio::try_join!(
+            self.inode_store.get(linkdirid),
+            self.inode_store.get(fileid),
+            self.directory_store.exists(linkdirid, linkname)
+        )?;
 
         check_access(&link_dir_inode, &creds, AccessMode::Write)?;
         check_access(&link_dir_inode, &creds, AccessMode::Execute)?;
@@ -1358,8 +1377,6 @@ impl ZeroFS {
             _ => return Err(FsError::NotDirectory),
         };
 
-        let mut file_inode = self.inode_store.get(fileid).await?;
-
         if matches!(file_inode, Inode::Directory(_)) {
             return Err(FsError::InvalidArgument);
         }
@@ -1368,7 +1385,7 @@ impl ZeroFS {
             return Err(FsError::InvalidArgument);
         }
 
-        if self.directory_store.exists(linkdirid, linkname).await? {
+        if exists {
             return Err(FsError::Exists);
         }
 
@@ -1933,14 +1950,17 @@ impl ZeroFS {
         );
 
         let _guard = self.lock_manager.acquire(dirid).await;
-        let mut dir_inode = self.inode_store.get(dirid).await?;
+        let (mut dir_inode, exists) = tokio::try_join!(
+            self.inode_store.get(dirid),
+            self.directory_store.exists(dirid, name)
+        )?;
 
         check_access(&dir_inode, creds, AccessMode::Write)?;
         check_access(&dir_inode, creds, AccessMode::Execute)?;
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
-                if self.directory_store.exists(dirid, name).await? {
+                if exists {
                     debug!("File already exists");
                     return Err(FsError::Exists);
                 }
