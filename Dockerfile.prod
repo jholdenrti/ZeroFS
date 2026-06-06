@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y \
    wget \
    && rm -rf /var/lib/apt/lists/*
 
-RUN wget https://github.com/Barre/ZeroFS/releases/download/v0.22.11/zerofs-pgo-multiplatform.tar.gz -O /tmp/zerofs.tar.gz && \
+RUN wget https://github.com/Barre/ZeroFS/releases/download/v1.0.14/zerofs-pgo-multiplatform.tar.gz -O /tmp/zerofs.tar.gz && \
     tar -xzf /tmp/zerofs.tar.gz -C /tmp && \
     if [ "$TARGETARCH" = "amd64" ]; then \
         cp /tmp/zerofs-linux-amd64-pgo /usr/local/bin/zerofs; \
